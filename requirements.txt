@@ -1,5 +1,0 @@
-# Calculadora ADRs Final v2.3 - Dependências
-# Instalar com: pip install -r requirements.txt
-
-yfinance>=0.2.0
-requests>=2.25.0
