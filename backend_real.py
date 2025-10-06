@@ -86,7 +86,8 @@ def is_after_hours_et(now=None):
     """Retorna True se horário atual em ET estiver dentro da janela de after hours (16h-21h)."""
     current = now or now_in_new_york()
     hour = current.hour
-    return 17 <= hour < 21
+    # Expandir janela para 16-21h para capturar dados after-hours mais cedo
+    return 16 <= hour < 21
 
 
 def trim_series_last_hours(timestamps, closes, hours=36, fallback_points=160):
@@ -905,3 +906,4 @@ if __name__ == '__main__':
     
     # Executar servidor
     run_server()
+
