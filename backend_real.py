@@ -1,0 +1,749 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Backend Real para Calculadora ADRs v2.3
+Dados reais do Yahoo Finance - SEM auto-incremento
+"""
+
+import json
+import time
+import urllib.request
+from urllib.parse import urlparse, parse_qs
+import logging
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
+from supabase import Client, create_client
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+except Exception:  # pragma: no cover - fallback if zoneinfo not available
+    ZoneInfo = None
+from http.server import HTTPServer, BaseHTTPRequestHandler
+try:
+    # Python 3.7+
+    from http.server import ThreadingHTTPServer  # type: ignore
+except Exception:  # pragma: no cover
+    ThreadingHTTPServer = HTTPServer  # fallback
+import os
+
+# Configurar logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Cache de dados
+data_cache = {
+    'vix': None,
+    'gold': None,
+    'iron': None,
+    'winfut': None,
+    'adrs': {},
+    'adrs_snapshots': {},
+    'macro': {},
+    'timestamp': None,
+    'status': 'initializing'
+}
+
+# Cache específico para /api/quote (evita excesso de chamadas externas)
+QUOTE_CACHE = {}
+QUOTE_TTL = 30  # segundos
+
+SUPABASE_CLIENT: Optional[Client] = None
+
+
+def to_iso_utc(timestamp):
+    """Converte timestamp unix para ISO UTC (sem warnings)."""
+    if not timestamp:
+        return None
+    try:
+        return datetime.fromtimestamp(int(timestamp), timezone.utc).isoformat()
+    except Exception:
+        return None
+
+
+def parse_iso_datetime(value):
+    """Converte string ISO em datetime (UTC) para comparações."""
+    if not value:
+        return None
+    try:
+        if isinstance(value, datetime):
+            return value
+        return datetime.fromisoformat(value.replace('Z', '+00:00'))
+    except Exception:
+        return None
+
+
+def now_in_new_york():
+    """Retorna datetime atual em Nova York, com fallback UTC caso zoneinfo indisponível."""
+    if ZoneInfo is not None:
+        try:
+            return datetime.now(ZoneInfo('America/New_York'))
+        except Exception:
+            pass
+    return datetime.utcnow()
+
+
+def is_after_hours_et(now=None):
+    """Retorna True se horário atual em ET estiver dentro da janela de after hours (16h-21h)."""
+    current = now or now_in_new_york()
+    hour = current.hour
+    return 17 <= hour < 21
+
+
+def trim_series_last_hours(timestamps, closes, hours=36, fallback_points=160):
+    """Mantém apenas os pontos das últimas `hours` horas; se não houver dados suficientes, retorna o fallback."""
+    if not timestamps or not closes:
+        return [], []
+
+    paired = [(ts, val) for ts, val in zip(timestamps, closes)]
+
+    latest_ts = None
+    for ts in reversed(timestamps):
+        if ts:
+            latest_ts = ts
+            break
+
+    if latest_ts:
+        cutoff = latest_ts - int(hours * 3600)
+        trimmed = [(ts, val) for ts, val in paired if ts and ts >= cutoff]
+    else:
+        trimmed = []
+
+    if len(trimmed) < 16:  # fallback para garantir volume mínimo de pontos
+        trimmed = paired[-fallback_points:]
+
+    trimmed_ts = [ts for ts, _ in trimmed]
+    trimmed_closes = [val for _, val in trimmed]
+    return trimmed_ts, trimmed_closes
+
+
+def get_cached_quote(ticker):
+    entry = QUOTE_CACHE.get(ticker)
+    if not entry:
+        return None
+    if time.time() - entry['timestamp'] > QUOTE_TTL:
+        QUOTE_CACHE.pop(ticker, None)
+        return None
+    return entry['data']
+
+
+def store_quote_cache(ticker, data):
+    if data:
+        QUOTE_CACHE[ticker] = {
+            'timestamp': time.time(),
+            'data': data
+        }
+
+
+def get_supabase_client():
+    global SUPABASE_CLIENT
+    if SUPABASE_CLIENT is not None:
+        return SUPABASE_CLIENT
+
+    url = os.environ.get('SUPABASE_URL')
+    key = os.environ.get('SUPABASE_SERVICE_KEY') or os.environ.get('SUPABASE_KEY')
+    if not url or not key:
+        logger.warning('Supabase não configurado. Variáveis SUPABASE_URL e SUPABASE_SERVICE_KEY ausentes.')
+        SUPABASE_CLIENT = None
+        return SUPABASE_CLIENT
+
+    try:
+        SUPABASE_CLIENT = create_client(url, key)
+        logger.info('Cliente Supabase inicializado com sucesso.')
+    except Exception as exc:
+        logger.error(f'Falha ao inicializar Supabase: {exc}')
+        SUPABASE_CLIENT = None
+    return SUPABASE_CLIENT
+
+
+def store_snapshot_in_supabase(ticker: str, snapshot_type: str, snapshot: Dict[str, Any]):
+    client = get_supabase_client()
+    if client is None:
+        return
+
+    try:
+        payload = {
+            'ticker': ticker,
+            'snapshot_type': snapshot_type,
+            'price': snapshot.get('price'),
+            'variation': snapshot.get('variation'),
+            'source_time': snapshot.get('time'),
+            'raw_payload': snapshot,
+        }
+        client.table('adr_snapshots').insert(payload).execute()
+    except Exception as exc:
+        logger.error(f'Erro ao salvar snapshot {ticker}/{snapshot_type} no Supabase: {exc}')
+
+
+def get_snapshot_history_from_supabase(ticker: str, snapshot_type: str, limit: int = 50):
+    client = get_supabase_client()
+    if client is None:
+        return []
+    try:
+        resp = client.table('adr_snapshots') \
+            .select('*') \
+            .eq('ticker', ticker) \
+            .eq('snapshot_type', snapshot_type) \
+            .order('captured_at', desc=True) \
+            .limit(limit) \
+            .execute()
+        return resp.data or []
+    except Exception as exc:
+        logger.error(f'Erro ao consultar histórico Supabase {ticker}/{snapshot_type}: {exc}')
+        return []
+
+# Tickers reais e funcionais
+TICKERS = {
+    'vix': '^VIX',
+    'gold': 'GC=F',
+    'iron': 'HG=F',  # Copper Futures (proxy para Iron Ore)
+    'winfut': '^BVSP',  # Ibovespa como proxy para WINFUT
+    'adrs': ['VALE', 'ITUB', 'PBR', 'PBR-A', 'BBD', 'BBDO', 'ABEV', 'ERJ', 'BSBR', 'BDORY'],
+    'macro': {
+        'ewz': 'EWZ',
+        'sp500': '^GSPC',
+        'oil': 'CL=F',
+        'brent': 'BZ=F',
+        'dxy': 'DX-Y.NYB'
+    }
+}
+
+def fetch_yahoo_data(ticker, is_adr=False):
+    """Busca dados reais do Yahoo Finance - After Market para ADRs"""
+    try:
+        # Usamos o endpoint de chart pois contém campos de post-market e regular
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=2d&interval=15m&includePrePost=true"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        
+        request = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(request, timeout=10) as response:
+            data = json.loads(response.read().decode())
+            
+        if 'chart' in data and 'result' in data['chart'] and data['chart']['result']:
+            result = data['chart']['result'][0]
+            meta = result.get('meta', {})
+            timestamps = result.get('timestamp', []) or []
+            indicators = (result.get('indicators', {}) or {}).get('quote', [{}])
+            closes = (indicators[0] if indicators else {}).get('close', []) or []
+            
+            # Encontrar último candle pós-fechamento para after-hours
+            regular_time = meta.get('regularMarketTime')
+            after_hours_price = meta.get('postMarketPrice')
+            post_change_pct = meta.get('postMarketChangePercent')
+            post_time = meta.get('postMarketTime')
+
+            if regular_time and timestamps and closes:
+                for ts, close in zip(reversed(timestamps), reversed(closes)):
+                    if ts is None or close is None:
+                        continue
+                    if ts > regular_time:
+                        after_hours_price = float(close)
+                        post_time = ts
+                        break
+
+            if is_adr:
+                regular_price = meta.get('regularMarketPrice')
+                previous_close = meta.get('previousClose')
+
+                if regular_price and previous_close:
+                    regular_price = float(regular_price)
+                    previous_close = float(previous_close)
+                    variation = ((regular_price - previous_close) / previous_close) * 100 if previous_close else 0.0
+
+                    if after_hours_price is not None and regular_price:
+                        post_change_pct = ((after_hours_price - regular_price) / regular_price) * 100
+
+                    trimmed_ts, trimmed_closes = trim_series_last_hours(timestamps, closes)
+
+                    return {
+                        'current': round(regular_price, 2),
+                        'variation': round(variation, 2),
+                        'timestamp': datetime.now().isoformat(),
+                        'ticker': ticker,
+                        'source': 'closing-price',
+                        'has_after_market': bool(after_hours_price),
+                        'data_type': 'closing',
+                        'message': 'Dados de fechamento (after-market disponível para preenchimento manual)',
+                        'at_close': {
+                            'price': round(regular_price, 2),
+                            'change_percent': round(variation, 2),
+                            'time': to_iso_utc(regular_time)
+                        },
+                        'after_hours': {
+                            'available': after_hours_price is not None,
+                            'price': round(after_hours_price, 2) if after_hours_price is not None else None,
+                            'change_percent': round(post_change_pct, 2) if (post_change_pct is not None) else None,
+                            'time': to_iso_utc(post_time)
+                        },
+                        'series': {
+                            'timestamps': [to_iso_utc(t) for t in trimmed_ts],
+                            'closes': [round(c, 4) if c is not None else None for c in trimmed_closes]
+                        },
+                        'snapshots': {
+                            'closing': {
+                                'price': round(previous_close, 2),
+                                'variation': round(variation, 2),  # Usar a variação calculada do fechamento atual
+                                'time': to_iso_utc(regular_time) if regular_time else to_iso_utc(meta.get('regularMarketPreviousCloseTime'))
+                            },
+                            'after_hours': {
+                                'price': round(after_hours_price, 2) if after_hours_price is not None else None,
+                                'variation': round(post_change_pct, 2) if (post_change_pct is not None) else None,
+                                'time': to_iso_utc(post_time)
+                            }
+                        }
+                    }
+                else:
+                    return {
+                        'current': None,
+                        'variation': None,
+                        'timestamp': datetime.now().isoformat(),
+                        'ticker': ticker,
+                        'source': 'no-data',
+                        'has_after_market': False,
+                        'data_type': 'closing',
+                        'message': 'Sem dados de fechamento disponíveis',
+                        'snapshots': {
+                            'closing': {
+                                'price': None,
+                                'variation': None,
+                                'time': None
+                            },
+                            'after_hours': {
+                                'price': None,
+                                'variation': None,
+                                'time': None
+                            }
+                        }
+                    }
+            else:
+                # Para outros ativos: usar regular market price
+                current_price = meta.get('regularMarketPrice')
+                previous_close = meta.get('previousClose', current_price)
+                regular_time = meta.get('regularMarketTime')
+                
+                if current_price and previous_close:
+                    variation = ((current_price - previous_close) / previous_close) * 100
+                    
+                    series_ts = timestamps
+                    series_closes = closes
+                    series_ts, series_closes = trim_series_last_hours(series_ts, series_closes)
+
+                    return {
+                        'current': round(current_price, 2),
+                        'variation': round(variation, 2),
+                        'timestamp': datetime.now().isoformat(),
+                        'ticker': ticker,
+                        'source': 'regular-market',
+                        # Campos adicionais padronizados
+                        'at_close': {
+                            'price': round(current_price, 2),
+                            'change_percent': round(variation, 2),
+                            'time': to_iso_utc(regular_time)
+                        },
+                        'series': {
+                            'timestamps': [to_iso_utc(t) for t in series_ts],
+                            'closes': [round(c, 4) if c is not None else None for c in series_closes]
+                        }
+                    }
+        return None
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            logger.warning(f"Ticker {ticker} não encontrado (404)")
+        else:
+            logger.error(f"Erro HTTP {e.code} ao buscar {ticker}")
+        return None
+    except Exception as e:
+        logger.error(f"Erro ao buscar {ticker}: {str(e)}")
+        return None
+
+
+def fetch_yfinance_data(ticker, is_adr=False):
+    """Busca dados usando yfinance e trata limites de rate limit."""
+    try:
+        import yfinance as yf  # importar apenas quando necessário
+    except Exception:
+        yf = None
+
+    if yf is None:
+        return fetch_yahoo_data(ticker, is_adr=is_adr)
+
+    try:
+        ticker_obj = yf.Ticker(ticker)
+
+        # `history` já respeita pre/post e evita várias requisições para quoteSummary
+        hist = None
+        try:
+            hist = ticker_obj.history(period='1d', interval='15m', prepost=True)
+        except Exception as err:
+            logger.warning(f"yfinance history falhou para {ticker}: {err}")
+
+        # Fast-info tem menos probabilidade de 429; fallback mínimo
+        info = {}
+        try:
+            if hasattr(ticker_obj, 'fast_info'):
+                info = ticker_obj.fast_info or {}
+        except Exception as err:
+            logger.warning(f"yfinance fast_info falhou para {ticker}: {err}")
+
+        regular_price = info.get('last_price')
+        previous_close = info.get('previous_close')
+        post_price = info.get('post_price')
+        post_change_pct = info.get('post_market_change_percent')
+        regular_time = info.get('last_update')
+        post_time = info.get('post_market_time')
+
+        # fallback leve usando quote (mais estável que quoteSummary)
+        if not regular_price or not previous_close:
+            try:
+                quote_data = ticker_obj.history(period='1d', interval='15m', prepost=False)
+                if quote_data is not None and len(quote_data) > 0:
+                    regular_price = regular_price or float(quote_data['Close'].iloc[-1])
+                    previous_close = previous_close or float(quote_data['Close'].iloc[0])
+            except Exception:
+                pass
+
+        series_ts = []
+        series_closes = []
+        after_time_hist = None
+        if hist is not None and len(hist) > 0:
+            raw_ts = [int(dt.timestamp()) if hasattr(dt, 'timestamp') else None for dt in hist.index]
+            raw_closes = [round(float(v), 4) if v == v else None for v in hist['Close'].tolist()]
+            trimmed_ts, trimmed_closes = trim_series_last_hours(raw_ts, raw_closes)
+            series_ts = [to_iso_utc(ts) for ts in trimmed_ts]
+            series_closes = trimmed_closes
+            if regular_time:
+                for dt, price in zip(reversed(hist.index), reversed(hist['Close'].tolist())):
+                    try:
+                        ts_val = int(dt.timestamp())
+                    except Exception:
+                        continue
+                    if price is None:
+                        continue
+                    if ts_val > int(regular_time):
+                        post_price = float(price)
+                        after_time_hist = ts_val
+                        break
+
+        if regular_price and previous_close:
+            variation = ((regular_price - previous_close) / (previous_close or regular_price)) * 100
+            if post_price is not None and regular_price:
+                post_change_pct = ((post_price - regular_price) / regular_price) * 100
+                post_time = post_time or after_time_hist
+            trimmed_ts, trimmed_closes = trim_series_last_hours(
+                [int(datetime.fromisoformat(ts).timestamp()) if ts else None for ts in series_ts],
+                series_closes
+            )
+            return {
+                'current': round(float(regular_price), 2),
+                'variation': round(float(variation), 2),
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'ticker': ticker,
+                'source': 'yfinance',
+                'data_type': 'closing' if is_adr else 'regular',
+                'has_after_market': bool(post_price),
+                'at_close': {
+                    'price': round(float(regular_price), 2),
+                    'change_percent': round(float(variation), 2),
+                    'time': to_iso_utc(regular_time)
+                },
+                'after_hours': {
+                    'available': post_price is not None,
+                    'price': round(float(post_price), 2) if post_price is not None else None,
+                    'change_percent': round(float(post_change_pct), 2) if post_change_pct is not None else None,
+                    'time': to_iso_utc(post_time)
+                },
+                'series': {
+                    'timestamps': [to_iso_utc(ts) for ts in trimmed_ts],
+                    'closes': trimmed_closes
+                }
+            }
+
+        data = fetch_yahoo_data(ticker, is_adr=is_adr)
+        if data:
+            store_quote_cache(ticker, data)
+        return data
+    except Exception as err:
+        logger.warning(f"yfinance falhou para {ticker}: {err}")
+        data = fetch_yahoo_data(ticker, is_adr=is_adr)
+        if data:
+            store_quote_cache(ticker, data)
+        return data
+
+def fetch_iron_ore_data():
+    """Busca dados do Iron Ore usando Copper Futures (HG=F) como proxy"""
+    logger.info("🔍 Buscando dados do Iron Ore...")
+    
+    try:
+        # Usar Copper Futures como proxy para Iron Ore
+        data = fetch_yahoo_data('HG=F')
+        if data and data['current'] and data['current'] > 0:
+            logger.info(f"✅ Iron Ore (HG=F): {data['current']} ({data['variation']:+.2f}%)")
+            return data
+    except Exception as e:
+        logger.warning(f"⚠️ HG=F falhou: {e}")
+    
+    # Fallback: dados simulados
+    logger.warning("⚠️ Usando dados simulados para Iron Ore")
+    import random
+    base_price = 4.5  # Preço base do Copper (proxy para Iron Ore)
+    variation = random.uniform(-1.0, 1.0)  # Variação simulada
+    
+    return {
+        'current': round(base_price, 2),
+        'variation': round(variation, 2),
+        'ticker': 'IRON-SIM',
+        'source': 'simulated',
+        'timestamp': datetime.now().isoformat()
+    }
+
+def fetch_market_data():
+    """Busca dados reais do mercado - APENAS quando solicitado"""
+    logger.info("Buscando dados reais do mercado...")
+    
+    try:
+        current_et = now_in_new_york()
+        in_after_hours = is_after_hours_et(current_et)
+
+        # VIX
+        vix_data = fetch_yahoo_data(TICKERS['vix'])
+        if vix_data:
+            data_cache['vix'] = vix_data
+            logger.info(f"VIX: {vix_data['current']} ({vix_data['variation']:+.2f}%)")
+        
+        # Gold
+        gold_data = fetch_yahoo_data(TICKERS['gold'])
+        if gold_data:
+            data_cache['gold'] = gold_data
+            logger.info(f"Gold: {gold_data['current']} ({gold_data['variation']:+.2f}%)")
+        
+        # Iron Ore - Estratégia multi-fonte
+        iron_data = fetch_iron_ore_data()
+        if iron_data:
+            data_cache['iron'] = iron_data
+            logger.info(f"Iron Ore ({iron_data['ticker']}): {iron_data['current']} ({iron_data['variation']:+.2f}%)")
+        
+        # WINFUT - Ibovespa como proxy
+        winfut_data = fetch_yahoo_data(TICKERS['winfut'])
+        if winfut_data:
+            data_cache['winfut'] = winfut_data
+            logger.info(f"WINFUT (Ibovespa): {winfut_data['current']} ({winfut_data['variation']:+.2f}%)")
+        
+        # ADRs - Buscar dados; snapshots after-hours apenas durante janela específica
+        for ticker in TICKERS['adrs']:
+            adr_data = fetch_yahoo_data(ticker, is_adr=True)
+            if adr_data:
+                data_cache['adrs'][ticker] = adr_data
+
+                snapshots = data_cache.setdefault('adrs_snapshots', {}).setdefault(ticker, {
+                    'closing': None,
+                    'after_hours': None,
+                    'closing_source_time': None,
+                    'after_hours_source_time': None
+                })
+
+                # Sempre atualizar snapshot de fechamento se houver dados válidos
+                closing_snapshot = (adr_data.get('snapshots') or {}).get('closing')
+                if closing_snapshot and closing_snapshot.get('price') is not None and closing_snapshot.get('variation') is not None:
+                    closing_time = parse_iso_datetime(closing_snapshot.get('time'))
+                    existing_time = parse_iso_datetime(snapshots.get('closing_source_time'))
+                    
+                    # Atualizar se não existe ou se é mais recente
+                    if not existing_time or (closing_time and closing_time > existing_time):
+                        snapshots['closing'] = closing_snapshot
+                        snapshots['closing_source_time'] = closing_snapshot.get('time')
+                        store_snapshot_in_supabase(ticker, 'closing', closing_snapshot)
+
+                # Atualizar snapshot after-hours se houver dados válidos
+                after_snapshot = (adr_data.get('snapshots') or {}).get('after_hours')
+                if in_after_hours and after_snapshot and after_snapshot.get('price') is not None and after_snapshot.get('variation') is not None:
+                    after_time = parse_iso_datetime(after_snapshot.get('time'))
+                    existing_after_time = parse_iso_datetime(snapshots.get('after_hours_source_time'))
+                    
+                    # Atualizar se não existe ou se é mais recente
+                    if not existing_after_time or (after_time and after_time > existing_after_time):
+                        snapshots['after_hours'] = after_snapshot
+                        snapshots['after_hours_source_time'] = after_snapshot.get('time')
+                        store_snapshot_in_supabase(ticker, 'after_hours', after_snapshot)
+
+                if adr_data.get('has_after_market', False):
+                    logger.info(f"✅ {ticker}: {adr_data['current']} ({adr_data['variation']:+.2f}%) 🕐 After-Market")
+                else:
+                    logger.info(f"❌ {ticker}: {adr_data.get('message', 'Sem after-market')} 📊 Regular Market")
+        
+        # Indicadores Macro
+        for key, ticker in TICKERS['macro'].items():
+            macro_data = fetch_yahoo_data(ticker)
+            if macro_data:
+                data_cache['macro'][key] = macro_data
+                logger.info(f"{key.upper()}: {macro_data['current']} ({macro_data['variation']:+.2f}%)")
+        
+        data_cache['timestamp'] = datetime.now().isoformat()
+        data_cache['status'] = 'success'
+        
+        logger.info("✅ Dados reais atualizados com sucesso")
+        
+    except Exception as e:
+        logger.error(f"❌ Erro ao buscar dados reais: {str(e)}")
+        data_cache['status'] = 'error'
+        data_cache['error'] = str(e)
+
+class APIHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        """Manipula requisições GET"""
+        parsed = urlparse(self.path)
+        path_only = parsed.path
+        query = parse_qs(parsed.query or '')
+
+        status_code = 200
+        payload = None
+
+        if path_only == '/':
+            payload = {
+                "service": "Calculadora ADRs Backend REAL",
+                "mode": "real",
+                "status": data_cache.get('status', 'unknown'),
+                "last_update": data_cache.get('timestamp', 'never'),
+                "timestamp": datetime.now().isoformat(),
+                "endpoints": [
+                    "/api/market-data",
+                    "/api/update",
+                    "/api/health",
+                    "/api/vix",
+                    "/api/gold",
+                    "/api/iron",
+                    "/api/adrs",
+                    "/api/macro",
+                    "/api/quote?ticker=XYZ"
+                ]
+            }
+        elif path_only == '/api/market-data':
+            payload = {
+                "status": "success",
+                "timestamp": data_cache.get('timestamp', datetime.now().isoformat()),
+                "data": {
+                    "vix": data_cache.get('vix', {}),
+                    "gold": data_cache.get('gold', {}),
+                    "iron": data_cache.get('iron', {}),
+                    "winfut": data_cache.get('winfut', {}),
+                    "adrs": data_cache.get('adrs', {}),
+                    "adrs_snapshots": data_cache.get('adrs_snapshots', {}),
+                    "macro": data_cache.get('macro', {})
+                }
+            }
+        elif path_only == '/api/health':
+            payload = {
+                "status": "ok",
+                "timestamp": datetime.now().isoformat(),
+                "data_status": data_cache.get('status', 'unknown'),
+                "last_update": data_cache.get('timestamp', 'never'),
+                "mode": "real"
+            }
+        elif path_only == '/api/update':
+            fetch_market_data()
+            payload = {
+                "status": "updated",
+                "timestamp": datetime.now().isoformat()
+            }
+        elif path_only == '/api/vix':
+            payload = data_cache.get('vix', {})
+        elif path_only == '/api/gold':
+            payload = data_cache.get('gold', {})
+        elif path_only == '/api/iron':
+            payload = data_cache.get('iron', {})
+        elif path_only == '/api/adrs':
+            payload = {
+                'data': data_cache.get('adrs', {}),
+                'snapshots': data_cache.get('adrs_snapshots', {})
+            }
+        elif path_only == '/api/adr-history':
+            ticker = (query.get('ticker') or [''])[0].strip().upper()
+            snap_type = (query.get('type') or ['closing'])[0].strip()
+            limit = int((query.get('limit') or ['50'])[0])
+            if not ticker:
+                status_code = 400
+                payload = {'status': 'error', 'error': 'ticker required'}
+            else:
+                data = get_snapshot_history_from_supabase(ticker, snap_type, limit)
+                payload = {'status': 'success', 'data': data, 'ticker': ticker, 'type': snap_type}
+        elif path_only == '/api/macro':
+            payload = data_cache.get('macro', {})
+        elif path_only == '/api/quote':
+            ticker = (query.get('ticker') or [''])[0].strip().upper()
+            if not ticker:
+                status_code = 400
+                payload = {"error": "ticker query param required"}
+            else:
+                cached = get_cached_quote(ticker)
+                if cached:
+                    payload = {"status": "success", "data": cached, "cached": True}
+                else:
+                    detailed = fetch_yfinance_data(ticker, is_adr=ticker.isalpha() and len(ticker) <= 5)
+                    if detailed:
+                        store_quote_cache(ticker, detailed)
+                        payload = {"status": "success", "data": detailed}
+                    else:
+                        status_code = 404
+                        payload = {"status": "error", "error": "No data"}
+        else:
+            status_code = 404
+            payload = {"error": "Endpoint not found"}
+
+        response = json.dumps(payload or {}, ensure_ascii=False)
+
+        # Enviar cabeçalhos após definir status e payload
+        self.send_response(status_code)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.end_headers()
+
+        try:
+            self.wfile.write(response.encode('utf-8'))
+        except ConnectionAbortedError:
+            logger.warning("Cliente fechou a conexão durante a resposta")
+        except Exception as exc:
+            logger.error(f"Erro ao enviar resposta: {exc}")
+    
+    def do_OPTIONS(self):
+        """Manipula requisições OPTIONS para CORS"""
+        self.send_response(200)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.end_headers()
+
+def run_server():
+    """Executa o servidor HTTP"""
+    server_address = ('', int(os.environ.get('PORT', '5000')))
+    httpd = ThreadingHTTPServer(server_address, APIHandler)
+    
+    logger.info("🚀 Servidor REAL iniciado em http://localhost:5000")
+    logger.info("📊 Modo: Dados reais do Yahoo Finance")
+    logger.info("🔄 Atualização: MANUAL (sem auto-incremento)")
+    logger.info("")
+    logger.info("Endpoints disponíveis:")
+    logger.info("  GET /api/market-data - Todos os dados")
+    logger.info("  GET /api/update - Forçar atualização")
+    logger.info("  GET /api/health - Status do servidor")
+    logger.info("  GET /api/vix - Dados do VIX")
+    logger.info("  GET /api/gold - Dados do Gold")
+    logger.info("  GET /api/iron - Dados do Iron Ore")
+    logger.info("  GET /api/adrs - Dados dos ADRs")
+    logger.info("  GET /api/macro - Dados macro")
+    logger.info("  GET /api/quote?ticker=XYZ - Detalhe (At Close, After Hours e série)")
+    logger.info("")
+    logger.info("💡 Para atualizar dados: http://localhost:5000/api/update")
+    
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        logger.info("Servidor parado pelo usuário")
+        httpd.shutdown()
+
+if __name__ == '__main__':
+    logger.info("Iniciando Calculadora ADRs Backend REAL v2.3")
+    
+    # Executar servidor
+    run_server()
