@@ -372,7 +372,7 @@ def process_adr_data(meta, after_hours_price, post_change_pct, post_time, regula
         }
 
 def process_regular_data(meta, timestamps, closes, ticker):
-    """Processa dados regulares (não-ADRs)"""
+    """Processa dados regulares (não-ADRs) com lógica completa para VIX"""
     current_price = meta.get('regularMarketPrice')
     previous_close = meta.get('previousClose')
     if previous_close is None:
@@ -386,7 +386,156 @@ def process_regular_data(meta, timestamps, closes, ticker):
 
     series_ts, series_closes = trim_series_last_hours(timestamps, closes)
 
-    # Lógica simplificada para dados regulares
+    # Lógica para calcular open_price, open_time e open_change_percent (necessário para VIX)
+    open_price = None
+    open_ts = None
+    open_change_pct = None
+    close_price = None
+    close_ts = None
+    close_change_pct = None
+    previous_close_ts = None
+
+    is_vix = ticker == TICKERS['vix']
+    
+    session_date = None
+    exchange_tz = None
+    if regular_time:
+        try:
+            rt_dt = datetime.fromtimestamp(int(regular_time), timezone.utc)
+            if ZoneInfo is not None:
+                try:
+                    exchange_tz = ZoneInfo(meta.get('exchangeTimezoneName') or 'America/New_York')
+                except Exception:
+                    exchange_tz = None
+            session_date = rt_dt.astimezone(exchange_tz).date() if exchange_tz else rt_dt.date()
+        except Exception:
+            session_date = None
+
+    # Encontrar preço de abertura
+    if timestamps and closes and session_date is not None:
+        for ts, close in zip(timestamps, closes):
+            if ts is None or close is None:
+                continue
+            try:
+                ts_int = int(ts)
+            except Exception:
+                continue
+            dt_utc = datetime.fromtimestamp(ts_int, timezone.utc)
+            dt_local = dt_utc.astimezone(exchange_tz) if exchange_tz else dt_utc
+            if dt_local.date() != session_date:
+                if dt_local.date() < session_date and previous_close_ts is None:
+                    previous_close_ts = ts_int
+                continue
+            open_ts = ts_int
+            open_price = float(close)
+            break
+
+        if open_price is None:
+            first_valid = next(((ts, close) for ts, close in zip(timestamps, closes) if ts and close is not None), None)
+            if first_valid:
+                try:
+                    open_ts = int(first_valid[0])
+                    open_price = float(first_valid[1])
+                except Exception:
+                    open_ts = None
+                    open_price = None
+
+    # Calcular variação da abertura
+    if open_price not in (None, 0) and current_price not in (None, 0):
+        try:
+            open_change_pct = ((current_price - open_price) / open_price) * 100
+        except Exception:
+            open_change_pct = None
+
+    # Encontrar preço de fechamento
+    if timestamps and closes and session_date is not None:
+        for ts, close in zip(reversed(timestamps), reversed(closes)):
+            if ts is None or close is None:
+                continue
+            try:
+                ts_int = int(ts)
+            except Exception:
+                continue
+            dt_utc = datetime.fromtimestamp(ts_int, timezone.utc)
+            dt_local = dt_utc.astimezone(exchange_tz) if exchange_tz else dt_utc
+            if dt_local.date() != session_date:
+                continue
+            close_ts = ts_int
+            close_price = float(close)
+            break
+
+    if close_price is None and series_closes:
+        try:
+            close_price = float(next(x for x in reversed(series_closes) if x is not None))
+            close_ts = next((int(ts) for ts in reversed(series_ts) if ts is not None), None)
+        except Exception:
+            close_price = None
+            close_ts = None
+
+    close_reference_time = close_ts
+    market_closed_today = not is_vix
+
+    # Lógica específica para VIX
+    if is_vix and session_date is not None:
+        try:
+            now_br = datetime.now(ZoneInfo('America/Sao_Paulo')) if ZoneInfo else datetime.utcnow()
+        except Exception:
+            now_br = datetime.utcnow()
+
+        if now_br.date() > session_date:
+            market_closed_today = True
+        elif now_br.date() == session_date:
+            cutoff = dt_time(17, 15)
+            if now_br.time() >= cutoff:
+                market_closed_today = True
+
+        if not market_closed_today:
+            close_price = None
+            close_reference_time = None
+            close_change_pct = None
+
+    if close_reference_time is None:
+        if prev_close_time:
+            close_reference_time = prev_close_time
+        elif previous_close_ts:
+            close_reference_time = previous_close_ts
+
+    display_close_br_iso = None
+
+    if is_vix:
+        try:
+            br_tz = ZoneInfo('America/Sao_Paulo') if ZoneInfo else None
+            base_tz = exchange_tz or timezone.utc
+            close_dt_local = None
+
+            if close_ts:
+                close_dt_local = datetime.fromtimestamp(close_ts, timezone.utc).astimezone(base_tz)
+            elif close_reference_time is not None:
+                parsed = parse_iso_datetime(close_reference_time)
+                if parsed:
+                    close_dt_local = parsed.astimezone(base_tz)
+                elif isinstance(close_reference_time, (int, float)):
+                    close_dt_local = datetime.fromtimestamp(int(close_reference_time), timezone.utc).astimezone(base_tz)
+
+            if br_tz is not None:
+                if market_closed_today and close_dt_local:
+                    adjusted = close_dt_local.astimezone(br_tz).replace(hour=17, minute=15, second=0, microsecond=0)
+                    display_close_br_iso = adjusted.astimezone(timezone.utc).isoformat()
+                elif not market_closed_today and prev_close_time:
+                    prev_dt = parse_iso_datetime(prev_close_time)
+                    if prev_dt:
+                        prev_local = prev_dt.astimezone(br_tz)
+                        adjusted_prev = prev_local.replace(hour=17, minute=15, second=0, microsecond=0)
+                        display_close_br_iso = adjusted_prev.astimezone(timezone.utc).isoformat()
+        except Exception:
+            pass
+
+    if close_price not in (None, 0) and previous_close not in (None, 0):
+        try:
+            close_change_pct = ((close_price - previous_close) / previous_close) * 100
+        except Exception:
+            close_change_pct = None
+
     return {
         'current': round(current_price, 2) if current_price is not None else None,
         'variation': round(variation, 2) if variation is not None else None,
@@ -394,14 +543,18 @@ def process_regular_data(meta, timestamps, closes, ticker):
         'ticker': ticker,
         'source': 'regular-market',
         'at_close': {
-            'price': round(current_price, 2) if current_price is not None else None,
-            'change_percent': round(variation, 2) if variation is not None else None,
-            'time': to_iso_utc(regular_time) if regular_time else to_iso_utc(prev_close_time)
+            'price': round(close_price, 2) if close_price is not None else (round(previous_close, 2) if previous_close is not None else None),
+            'change_percent': round(close_change_pct, 2) if close_change_pct is not None else (round(variation, 2) if variation is not None else None),
+            'time': (to_iso_utc(close_reference_time) if close_reference_time else (to_iso_utc(prev_close_time) if prev_close_time else to_iso_utc(regular_time)))
         },
         'series': {
             'timestamps': [to_iso_utc(t) for t in series_ts],
             'closes': [round(c, 4) if c is not None else None for c in series_closes]
-        }
+        },
+        'open_price': round(open_price, 2) if open_price is not None else None,
+        'open_time': to_iso_utc(open_ts),
+        'open_change_percent': round(open_change_pct, 2) if open_change_pct is not None else None,
+        'at_close_display_time': display_close_br_iso
     }
     return None
 
