@@ -241,13 +241,34 @@ def get_snapshot_history_from_supabase(ticker: str, snapshot_type: str, limit: i
     # Tentar buscar do Supabase se disponível
     if client is not None:
         try:
-            resp = client.table('adr_snapshots') \
-                .select('*') \
-                .eq('ticker', ticker) \
-                .eq('snapshot_type', snapshot_type) \
-                .order('captured_at', desc=True) \
-                .limit(limit) \
-                .execute()
+            # Para snapshots de fechamento, buscar apenas do dia anterior
+            if snapshot_type == 'closing':
+                # Calcular data de ontem em UTC
+                from datetime import datetime, timezone, timedelta
+                yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+                yesterday_str = yesterday.strftime('%Y-%m-%d')
+                
+                logger.info(f"🔍 Buscando snapshots de fechamento de ontem ({yesterday_str}) para {ticker}")
+                
+                resp = client.table('adr_snapshots') \
+                    .select('*') \
+                    .eq('ticker', ticker) \
+                    .eq('snapshot_type', snapshot_type) \
+                    .gte('captured_at', f'{yesterday_str}T00:00:00+00:00') \
+                    .lt('captured_at', f'{yesterday_str}T23:59:59+00:00') \
+                    .order('captured_at', desc=True) \
+                    .limit(limit) \
+                    .execute()
+            else:
+                # Para after_hours, buscar normalmente (último snapshot)
+                resp = client.table('adr_snapshots') \
+                    .select('*') \
+                    .eq('ticker', ticker) \
+                    .eq('snapshot_type', snapshot_type) \
+                    .order('captured_at', desc=True) \
+                    .limit(limit) \
+                    .execute()
+            
             return resp.data or []
         except Exception as exc:
             logger.error(f'Erro ao consultar histórico Supabase {ticker}/{snapshot_type}: {exc}')
