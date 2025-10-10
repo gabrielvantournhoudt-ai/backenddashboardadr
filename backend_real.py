@@ -1209,10 +1209,33 @@ async def fetch_market_data_async():
                             closing_time = parse_iso_datetime(closing_snapshot.get('time'))
                             existing_time = parse_iso_datetime(snapshots.get('closing_source_time'))
                             
-                            if not existing_time or (closing_time and closing_time > existing_time):
-                                snapshots['closing'] = closing_snapshot
-                                snapshots['closing_source_time'] = closing_snapshot.get('time')
-                                store_snapshot_in_supabase(ticker, 'closing', closing_snapshot)
+                            # Verificar se é realmente fechamento oficial (exatamente às 17:00 BR)
+                            is_official_closing = False
+                            if closing_time:
+                                # Converter para horário de Brasília
+                                try:
+                                    if ZoneInfo is not None:
+                                        br_tz = ZoneInfo('America/Sao_Paulo')
+                                        closing_br = closing_time.astimezone(br_tz)
+                                        # Considerar fechamento oficial entre 16:58 e 17:02 BR (janela de fechamento)
+                                        is_official_closing = (closing_br.hour == 16 and closing_br.minute >= 58) or (closing_br.hour == 17 and closing_br.minute <= 2)
+                                    else:
+                                        # Fallback: considerar fechamento apenas às 20:00 UTC (17:00 BR)
+                                        is_official_closing = closing_time.hour == 20 and closing_time.minute == 0
+                                except Exception:
+                                    is_official_closing = False
+                            
+                            # Só atualizar snapshot de closing se for fechamento oficial
+                            if is_official_closing:
+                                if not existing_time or (closing_time and closing_time > existing_time):
+                                    snapshots['closing'] = closing_snapshot
+                                    snapshots['closing_source_time'] = closing_snapshot.get('time')
+                                    store_snapshot_in_supabase(ticker, 'closing', closing_snapshot)
+                                    logger.info(f"✅ {ticker} fechamento oficial salvo: {closing_snapshot.get('variation')}%")
+                            else:
+                                # Salvar como snapshot de intraday (não oficial)
+                                store_snapshot_in_supabase(ticker, 'intraday', closing_snapshot)
+                                logger.info(f"📊 {ticker} dados intraday salvos: {closing_snapshot.get('variation')}%")
                         
                         after_snapshot = (adr_data.get('snapshots') or {}).get('after_hours')
                         if in_after_hours and after_snapshot and after_snapshot.get('price') is not None:
@@ -1317,17 +1340,38 @@ def fetch_market_data_legacy():
                     'after_hours_source_time': None
                 })
 
-                # Sempre atualizar snapshot de fechamento se houver dados válidos
+                # Atualizar snapshot de fechamento apenas se for fechamento oficial
                 closing_snapshot = (adr_data.get('snapshots') or {}).get('closing')
                 if closing_snapshot and closing_snapshot.get('price') is not None and closing_snapshot.get('variation') is not None:
                     closing_time = parse_iso_datetime(closing_snapshot.get('time'))
                     existing_time = parse_iso_datetime(snapshots.get('closing_source_time'))
                     
-                    # Atualizar se não existe ou se é mais recente
-                    if not existing_time or (closing_time and closing_time > existing_time):
-                        snapshots['closing'] = closing_snapshot
-                        snapshots['closing_source_time'] = closing_snapshot.get('time')
-                        store_snapshot_in_supabase(ticker, 'closing', closing_snapshot)
+                    # Verificar se é fechamento oficial (exatamente às 17:00 BR)
+                    is_official_closing = False
+                    if closing_time:
+                        try:
+                            if ZoneInfo is not None:
+                                br_tz = ZoneInfo('America/Sao_Paulo')
+                                closing_br = closing_time.astimezone(br_tz)
+                                # Considerar fechamento oficial entre 16:58 e 17:02 BR (janela de fechamento)
+                                is_official_closing = (closing_br.hour == 16 and closing_br.minute >= 58) or (closing_br.hour == 17 and closing_br.minute <= 2)
+                            else:
+                                # Fallback: considerar fechamento apenas às 20:00 UTC (17:00 BR)
+                                is_official_closing = closing_time.hour == 20 and closing_time.minute == 0
+                        except Exception:
+                            is_official_closing = False
+                    
+                    # Só atualizar se for fechamento oficial
+                    if is_official_closing:
+                        if not existing_time or (closing_time and closing_time > existing_time):
+                            snapshots['closing'] = closing_snapshot
+                            snapshots['closing_source_time'] = closing_snapshot.get('time')
+                            store_snapshot_in_supabase(ticker, 'closing', closing_snapshot)
+                            logger.info(f"✅ {ticker} fechamento oficial salvo: {closing_snapshot.get('variation')}%")
+                    else:
+                        # Salvar como intraday
+                        store_snapshot_in_supabase(ticker, 'intraday', closing_snapshot)
+                        logger.info(f"📊 {ticker} dados intraday salvos: {closing_snapshot.get('variation')}%")
 
                 # Atualizar snapshot after-hours se houver dados válidos
                 after_snapshot = (adr_data.get('snapshots') or {}).get('after_hours')
