@@ -49,6 +49,9 @@ data_cache = {
     'status': 'initializing'
 }
 
+# Cache local para snapshots (fallback quando Supabase não está disponível)
+LOCAL_SNAPSHOTS_CACHE = {}
+
 # Cache específico para /api/quote (evita excesso de chamadas externas)
 QUOTE_CACHE = {}
 QUOTE_TTL = 300  # 5 minutos - aumentado para reduzir chamadas
@@ -197,39 +200,80 @@ def get_supabase_client():
 
 def store_snapshot_in_supabase(ticker: str, snapshot_type: str, snapshot: Dict[str, Any]):
     client = get_supabase_client()
-    if client is None:
-        return
+    
+    # Tentar salvar no Supabase se disponível
+    if client is not None:
+        try:
+            payload = {
+                'ticker': ticker,
+                'snapshot_type': snapshot_type,
+                'price': snapshot.get('price'),
+                'variation': snapshot.get('variation'),
+                'source_time': snapshot.get('time'),
+                'raw_payload': snapshot,
+            }
+            client.table('adr_snapshots').insert(payload).execute()
+            logger.info(f'✅ Snapshot {ticker}/{snapshot_type} salvo no Supabase')
+            return
+        except Exception as exc:
+            logger.error(f'Erro ao salvar snapshot {ticker}/{snapshot_type} no Supabase: {exc}')
+    
+    # Fallback: salvar no cache local
+    store_snapshot_locally(ticker, snapshot_type, snapshot)
 
-    try:
-        payload = {
-            'ticker': ticker,
-            'snapshot_type': snapshot_type,
-            'price': snapshot.get('price'),
-            'variation': snapshot.get('variation'),
-            'source_time': snapshot.get('time'),
-            'raw_payload': snapshot,
-        }
-        client.table('adr_snapshots').insert(payload).execute()
-    except Exception as exc:
-        logger.error(f'Erro ao salvar snapshot {ticker}/{snapshot_type} no Supabase: {exc}')
+def store_snapshot_locally(ticker: str, snapshot_type: str, snapshot: Dict[str, Any]):
+    """Salva snapshot no cache local como fallback"""
+    if not LOCAL_SNAPSHOTS_CACHE.get(ticker):
+        LOCAL_SNAPSHOTS_CACHE[ticker] = {}
+    
+    LOCAL_SNAPSHOTS_CACHE[ticker][snapshot_type] = {
+        'price': snapshot.get('price'),
+        'variation': snapshot.get('variation'),
+        'time': snapshot.get('time'),
+        'timestamp': datetime.now(timezone.utc).isoformat()
+    }
+    logger.info(f'📦 Snapshot {ticker}/{snapshot_type} salvo localmente')
 
 
 def get_snapshot_history_from_supabase(ticker: str, snapshot_type: str, limit: int = 50):
     client = get_supabase_client()
-    if client is None:
+    
+    # Tentar buscar do Supabase se disponível
+    if client is not None:
+        try:
+            resp = client.table('adr_snapshots') \
+                .select('*') \
+                .eq('ticker', ticker) \
+                .eq('snapshot_type', snapshot_type) \
+                .order('captured_at', desc=True) \
+                .limit(limit) \
+                .execute()
+            return resp.data or []
+        except Exception as exc:
+            logger.error(f'Erro ao consultar histórico Supabase {ticker}/{snapshot_type}: {exc}')
+    
+    # Fallback: buscar do cache local
+    return get_snapshot_history_locally(ticker, snapshot_type, limit)
+
+def get_snapshot_history_locally(ticker: str, snapshot_type: str, limit: int = 50):
+    """Busca histórico de snapshots no cache local"""
+    if ticker not in LOCAL_SNAPSHOTS_CACHE:
         return []
-    try:
-        resp = client.table('adr_snapshots') \
-            .select('*') \
-            .eq('ticker', ticker) \
-            .eq('snapshot_type', snapshot_type) \
-            .order('captured_at', desc=True) \
-            .limit(limit) \
-            .execute()
-        return resp.data or []
-    except Exception as exc:
-        logger.error(f'Erro ao consultar histórico Supabase {ticker}/{snapshot_type}: {exc}')
+    
+    snapshot_data = LOCAL_SNAPSHOTS_CACHE[ticker].get(snapshot_type)
+    if not snapshot_data:
         return []
+    
+    # Formatar no mesmo formato do Supabase
+    return [{
+        'ticker': ticker,
+        'snapshot_type': snapshot_type,
+        'price': snapshot_data.get('price'),
+        'variation': snapshot_data.get('variation'),
+        'source_time': snapshot_data.get('time'),
+        'captured_at': snapshot_data.get('timestamp'),
+        'raw_payload': snapshot_data
+    }]
 
 
 def cleanup_old_snapshots():
@@ -1024,13 +1068,8 @@ def fetch_iron_ore_data():
     }
 
 def load_latest_snapshots_from_supabase():
-    """Carrega últimos snapshots do Supabase para preencher cache em memória ao iniciar."""
-    client = get_supabase_client()
-    if client is None:
-        logger.warning("Supabase não disponível - snapshots não serão carregados")
-        return
-    
-    logger.info("📥 Carregando últimos snapshots do Supabase...")
+    """Carrega últimos snapshots do Supabase ou cache local para preencher cache em memória ao iniciar."""
+    logger.info("📥 Carregando últimos snapshots (Supabase ou cache local)...")
     
     for ticker in TICKERS['adrs']:
         try:
@@ -1073,7 +1112,7 @@ def load_latest_snapshots_from_supabase():
         except Exception as exc:
             logger.error(f"Erro ao carregar snapshots do {ticker}: {exc}")
     
-    logger.info("✅ Snapshots do Supabase carregados no cache")
+    logger.info("✅ Snapshots carregados no cache")
 
 async def fetch_market_data_async():
     """Versão assíncrona otimizada para buscar dados em paralelo"""
