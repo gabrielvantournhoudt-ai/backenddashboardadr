@@ -12,6 +12,10 @@ from urllib.parse import urlparse, parse_qs
 import logging
 from datetime import datetime, timezone, time as dt_time, timedelta
 from typing import Any, Dict, List, Optional
+import asyncio
+import aiohttp
+import concurrent.futures
+from threading import Thread
 
 from supabase import Client, create_client
 try:
@@ -47,7 +51,8 @@ data_cache = {
 
 # Cache específico para /api/quote (evita excesso de chamadas externas)
 QUOTE_CACHE = {}
-QUOTE_TTL = 30  # segundos
+QUOTE_TTL = 300  # 5 minutos - aumentado para reduzir chamadas
+MARKET_CACHE_TTL = 120  # 2 minutos para dados de mercado
 
 SUPABASE_CLIENT: Optional[Client] = None
 
@@ -135,6 +140,38 @@ def store_quote_cache(ticker, data):
             'timestamp': time.time(),
             'data': data
         }
+
+def is_cache_valid():
+    """Verifica se o cache de mercado está válido"""
+    if not data_cache.get('timestamp'):
+        return False
+    
+    try:
+        cache_time = datetime.fromisoformat(data_cache['timestamp'].replace('Z', '+00:00'))
+        now = datetime.now(timezone.utc)
+        age_seconds = (now - cache_time).total_seconds()
+        return age_seconds < MARKET_CACHE_TTL
+    except Exception:
+        return False
+
+def get_cached_market_data():
+    """Retorna dados de mercado do cache se válidos"""
+    if is_cache_valid() and data_cache.get('status') == 'success':
+        return {
+            "status": "success",
+            "timestamp": data_cache.get('timestamp'),
+            "data": {
+                "vix": data_cache.get('vix', {}),
+                "gold": data_cache.get('gold', {}),
+                "iron": data_cache.get('iron', {}),
+                "winfut": data_cache.get('winfut', {}),
+                "nasdaq": data_cache.get('nasdaq', {}),
+                "adrs": data_cache.get('adrs', {}),
+                "adrs_snapshots": data_cache.get('adrs_snapshots', {}),
+                "macro": data_cache.get('macro', {})
+            }
+        }
+    return None
 
 
 def get_supabase_client():
@@ -236,6 +273,159 @@ TICKERS = {
         'dxy': 'DX-Y.NYB'
     }
 }
+
+def process_yahoo_response(data, ticker, is_adr=False):
+    """Processa resposta do Yahoo Finance"""
+    if 'chart' in data and 'result' in data['chart'] and data['chart']['result']:
+        result = data['chart']['result'][0]
+        meta = result.get('meta', {})
+        timestamps = result.get('timestamp', []) or []
+        indicators = (result.get('indicators', {}) or {}).get('quote', [{}])
+        closes = (indicators[0] if indicators else {}).get('close', []) or []
+        
+        # Encontrar último candle pós-fechamento para after-hours
+        regular_time = meta.get('regularMarketTime')
+        after_hours_price = meta.get('postMarketPrice')
+        post_change_pct = meta.get('postMarketChangePercent')
+        post_time = meta.get('postMarketTime')
+
+        if regular_time and timestamps and closes:
+            for ts, close in zip(reversed(timestamps), reversed(closes)):
+                if ts is None or close is None:
+                    continue
+                if ts > regular_time:
+                    after_hours_price = float(close)
+                    post_time = ts
+                    break
+
+        if is_adr:
+            return process_adr_data(meta, after_hours_price, post_change_pct, post_time, regular_time, timestamps, closes, ticker)
+        else:
+            return process_regular_data(meta, timestamps, closes, ticker)
+
+def process_adr_data(meta, after_hours_price, post_change_pct, post_time, regular_time, timestamps, closes, ticker):
+    """Processa dados específicos de ADRs"""
+    regular_price = meta.get('regularMarketPrice')
+    previous_close = meta.get('previousClose')
+
+    if regular_price and previous_close:
+        regular_price = float(regular_price)
+        previous_close = float(previous_close)
+        variation = ((regular_price - previous_close) / previous_close) * 100 if previous_close else 0.0
+
+        if after_hours_price is not None and regular_price:
+            post_change_pct = ((after_hours_price - regular_price) / regular_price) * 100
+
+        trimmed_ts, trimmed_closes = trim_series_last_hours(timestamps, closes)
+
+        return {
+            'current': round(regular_price, 2),
+            'variation': round(variation, 2),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'ticker': ticker,
+            'source': 'closing-price',
+            'has_after_market': bool(after_hours_price),
+            'data_type': 'closing',
+            'message': 'Dados de fechamento (after-market disponível para preenchimento manual)',
+            'at_close': {
+                'price': round(regular_price, 2),
+                'change_percent': round(variation, 2),
+                'time': to_iso_utc(regular_time)
+            },
+            'after_hours': {
+                'available': after_hours_price is not None,
+                'price': round(after_hours_price, 2) if after_hours_price is not None else None,
+                'change_percent': round(post_change_pct, 2) if (post_change_pct is not None) else None,
+                'time': to_iso_utc(post_time)
+            },
+            'series': {
+                'timestamps': [to_iso_utc(t) for t in trimmed_ts],
+                'closes': [round(c, 4) if c is not None else None for c in trimmed_closes]
+            },
+            'snapshots': {
+                'closing': {
+                    'price': round(previous_close, 2),
+                    'variation': round(variation, 2),
+                    'time': to_iso_utc(regular_time) if regular_time else to_iso_utc(meta.get('regularMarketPreviousCloseTime'))
+                },
+                'after_hours': {
+                    'price': round(after_hours_price, 2) if after_hours_price is not None else None,
+                    'variation': round(post_change_pct, 2) if (post_change_pct is not None) else None,
+                    'time': to_iso_utc(post_time)
+                }
+            }
+        }
+    else:
+        return {
+            'current': None,
+            'variation': None,
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'ticker': ticker,
+            'source': 'no-data',
+            'has_after_market': False,
+            'data_type': 'closing',
+            'message': 'Sem dados de fechamento disponíveis',
+            'snapshots': {
+                'closing': {'price': None, 'variation': None, 'time': None},
+                'after_hours': {'price': None, 'variation': None, 'time': None}
+            }
+        }
+
+def process_regular_data(meta, timestamps, closes, ticker):
+    """Processa dados regulares (não-ADRs)"""
+    current_price = meta.get('regularMarketPrice')
+    previous_close = meta.get('previousClose')
+    if previous_close is None:
+        previous_close = meta.get('chartPreviousClose')
+    regular_time = meta.get('regularMarketTime')
+    prev_close_time = meta.get('regularMarketPreviousCloseTime')
+
+    variation = None
+    if current_price not in (None, 0) and previous_close not in (None, 0):
+        variation = ((current_price - previous_close) / previous_close) * 100
+
+    series_ts, series_closes = trim_series_last_hours(timestamps, closes)
+
+    # Lógica simplificada para dados regulares
+    return {
+        'current': round(current_price, 2) if current_price is not None else None,
+        'variation': round(variation, 2) if variation is not None else None,
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+        'ticker': ticker,
+        'source': 'regular-market',
+        'at_close': {
+            'price': round(current_price, 2) if current_price is not None else None,
+            'change_percent': round(variation, 2) if variation is not None else None,
+            'time': to_iso_utc(regular_time) if regular_time else to_iso_utc(prev_close_time)
+        },
+        'series': {
+            'timestamps': [to_iso_utc(t) for t in series_ts],
+            'closes': [round(c, 4) if c is not None else None for c in series_closes]
+        }
+    }
+    return None
+
+async def fetch_yahoo_data_async(session, ticker, is_adr=False):
+    """Versão assíncrona para buscar dados do Yahoo Finance"""
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=2d&interval=15m&includePrePost=true"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=8)) as response:
+            if response.status == 200:
+                data = await response.json()
+                return process_yahoo_response(data, ticker, is_adr)
+            elif response.status == 404:
+                logger.warning(f"Ticker {ticker} não encontrado (404)")
+            else:
+                logger.error(f"Erro HTTP {response.status} ao buscar {ticker}")
+    except asyncio.TimeoutError:
+        logger.error(f"Timeout ao buscar {ticker}")
+    except Exception as e:
+        logger.error(f"Erro ao buscar {ticker}: {str(e)}")
+    return None
 
 def fetch_yahoo_data(ticker, is_adr=False):
     """Busca dados reais do Yahoo Finance - After Market para ADRs"""
@@ -732,9 +922,159 @@ def load_latest_snapshots_from_supabase():
     
     logger.info("✅ Snapshots do Supabase carregados no cache")
 
+async def fetch_market_data_async():
+    """Versão assíncrona otimizada para buscar dados em paralelo"""
+    logger.info("🔄 fetch_market_data_async iniciada - busca paralela")
+    
+    try:
+        current_et = now_in_new_york()
+        in_after_hours = is_after_hours_et(current_et)
+        logger.info(f"🕐 Current ET time: {current_et}, in_after_hours: {in_after_hours}")
+
+        # Criar sessão aiohttp com configurações otimizadas
+        connector = aiohttp.TCPConnector(limit=20, limit_per_host=10)
+        timeout = aiohttp.ClientTimeout(total=10, connect=3)
+        
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            # Preparar todas as tarefas assíncronas
+            tasks = []
+            
+            # Tickers principais
+            tasks.append(fetch_yahoo_data_async(session, TICKERS['vix']))
+            tasks.append(fetch_yahoo_data_async(session, TICKERS['gold']))
+            tasks.append(fetch_yahoo_data_async(session, TICKERS['iron']))
+            tasks.append(fetch_yahoo_data_async(session, TICKERS['winfut']))
+            tasks.append(fetch_yahoo_data_async(session, TICKERS['nasdaq']))
+            
+            # ADRs
+            for ticker in TICKERS['adrs']:
+                tasks.append(fetch_yahoo_data_async(session, ticker, is_adr=True))
+            
+            # Macro
+            for key, ticker in TICKERS['macro'].items():
+                tasks.append(fetch_yahoo_data_async(session, ticker))
+            
+            # Executar todas as tarefas em paralelo
+            logger.info(f"🚀 Executando {len(tasks)} requisições em paralelo...")
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Processar resultados
+            result_index = 0
+            
+            # VIX
+            if result_index < len(results) and not isinstance(results[result_index], Exception):
+                data_cache['vix'] = results[result_index]
+                if results[result_index]:
+                    logger.info(f"✅ VIX: {results[result_index]['current']} ({results[result_index]['variation']:+.2f}%)")
+            result_index += 1
+            
+            # Gold
+            if result_index < len(results) and not isinstance(results[result_index], Exception):
+                data_cache['gold'] = results[result_index]
+                if results[result_index]:
+                    logger.info(f"✅ Gold: {results[result_index]['current']} ({results[result_index]['variation']:+.2f}%)")
+            result_index += 1
+            
+            # Iron
+            if result_index < len(results) and not isinstance(results[result_index], Exception):
+                data_cache['iron'] = results[result_index]
+                if results[result_index]:
+                    logger.info(f"✅ Iron Ore: {results[result_index]['current']} ({results[result_index]['variation']:+.2f}%)")
+            result_index += 1
+            
+            # WINFUT
+            if result_index < len(results) and not isinstance(results[result_index], Exception):
+                data_cache['winfut'] = results[result_index]
+                if results[result_index]:
+                    logger.info(f"✅ WINFUT (Ibovespa): {results[result_index]['current']} ({results[result_index]['variation']:+.2f}%)")
+            result_index += 1
+            
+            # Nasdaq
+            if result_index < len(results) and not isinstance(results[result_index], Exception):
+                data_cache['nasdaq'] = results[result_index]
+                if results[result_index]:
+                    logger.info(f"✅ Nasdaq 100: {results[result_index]['current']} ({results[result_index]['variation']:+.2f}%)")
+            result_index += 1
+            
+            # ADRs
+            for ticker in TICKERS['adrs']:
+                if result_index < len(results) and not isinstance(results[result_index], Exception):
+                    adr_data = results[result_index]
+                    if adr_data:
+                        data_cache['adrs'][ticker] = adr_data
+                        
+                        # Processar snapshots
+                        snapshots = data_cache.setdefault('adrs_snapshots', {}).setdefault(ticker, {
+                            'closing': None,
+                            'after_hours': None,
+                            'closing_source_time': None,
+                            'after_hours_source_time': None
+                        })
+                        
+                        # Atualizar snapshots conforme lógica existente
+                        closing_snapshot = (adr_data.get('snapshots') or {}).get('closing')
+                        if closing_snapshot and closing_snapshot.get('price') is not None:
+                            closing_time = parse_iso_datetime(closing_snapshot.get('time'))
+                            existing_time = parse_iso_datetime(snapshots.get('closing_source_time'))
+                            
+                            if not existing_time or (closing_time and closing_time > existing_time):
+                                snapshots['closing'] = closing_snapshot
+                                snapshots['closing_source_time'] = closing_snapshot.get('time')
+                                store_snapshot_in_supabase(ticker, 'closing', closing_snapshot)
+                        
+                        after_snapshot = (adr_data.get('snapshots') or {}).get('after_hours')
+                        if in_after_hours and after_snapshot and after_snapshot.get('price') is not None:
+                            after_time = parse_iso_datetime(after_snapshot.get('time'))
+                            existing_after_time = parse_iso_datetime(snapshots.get('after_hours_source_time'))
+                            
+                            if not existing_after_time or (after_time and after_time > existing_after_time):
+                                snapshots['after_hours'] = after_snapshot
+                                snapshots['after_hours_source_time'] = after_snapshot.get('time')
+                                store_snapshot_in_supabase(ticker, 'after_hours', after_snapshot)
+                        
+                        logger.info(f"✅ {ticker}: {adr_data['current']} ({adr_data['variation']:+.2f}%)")
+                result_index += 1
+            
+            # Macro
+            for key, ticker in TICKERS['macro'].items():
+                if result_index < len(results) and not isinstance(results[result_index], Exception):
+                    macro_data = results[result_index]
+                    if macro_data:
+                        data_cache['macro'][key] = macro_data
+                        logger.info(f"✅ {key.upper()}: {macro_data['current']} ({macro_data['variation']:+.2f}%)")
+                result_index += 1
+        
+        data_cache['timestamp'] = datetime.now(timezone.utc).isoformat()
+        data_cache['status'] = 'success'
+        
+        logger.info("✅ Dados atualizados com sucesso via método assíncrono")
+        
+        # Limpeza automática de dados antigos
+        cleanup_old_snapshots()
+        
+    except Exception as e:
+        logger.error(f"❌ Erro na busca assíncrona: {str(e)}")
+        data_cache['status'] = 'error'
+        data_cache['error'] = str(e)
+
 def fetch_market_data():
-    """Busca dados reais do mercado - APENAS quando solicitado"""
-    logger.info("🔄 fetch_market_data chamada (manual ou automática)")
+    """Busca dados reais do mercado - versão otimizada com execução assíncrona"""
+    logger.info("🔄 fetch_market_data chamada - usando método assíncrono otimizado")
+    
+    try:
+        # Executar função assíncrona em thread separada
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(fetch_market_data_async())
+        loop.close()
+    except Exception as e:
+        logger.error(f"❌ Erro ao executar fetch_market_data: {str(e)}")
+        data_cache['status'] = 'error'
+        data_cache['error'] = str(e)
+
+def fetch_market_data_legacy():
+    """Busca dados reais do mercado - método legacy (mantido como fallback)"""
+    logger.info("🔄 fetch_market_data_legacy chamada (fallback)")
     logger.info("Buscando dados reais do mercado...")
     
     try:
@@ -868,20 +1208,38 @@ class APIHandler(BaseHTTPRequestHandler):
                 ]
             }
         elif path_only == '/api/market-data':
-            payload = {
-                "status": "success",
-                "timestamp": data_cache.get('timestamp', datetime.now().isoformat()),
-                "data": {
-                    "vix": data_cache.get('vix', {}),
-                    "gold": data_cache.get('gold', {}),
-                    "iron": data_cache.get('iron', {}),
-                    "winfut": data_cache.get('winfut', {}),
-                    "nasdaq": data_cache.get('nasdaq', {}),
-                    "adrs": data_cache.get('adrs', {}),
-                    "adrs_snapshots": data_cache.get('adrs_snapshots', {}),
-                    "macro": data_cache.get('macro', {})
+            # Verificar se há cache válido
+            cached_data = get_cached_market_data()
+            if cached_data:
+                payload = cached_data
+                logger.info("📦 Dados servidos do cache")
+            else:
+                # Cache expirado ou inválido - forçar atualização
+                logger.info("🔄 Cache expirado - forçando atualização")
+                try:
+                    # Usar versão assíncrona otimizada
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    loop.run_until_complete(fetch_market_data_async())
+                    loop.close()
+                except Exception as e:
+                    logger.error(f"Erro ao atualizar dados: {e}")
+                
+                # Retornar dados atualizados
+                payload = {
+                    "status": "success",
+                    "timestamp": data_cache.get('timestamp', datetime.now().isoformat()),
+                    "data": {
+                        "vix": data_cache.get('vix', {}),
+                        "gold": data_cache.get('gold', {}),
+                        "iron": data_cache.get('iron', {}),
+                        "winfut": data_cache.get('winfut', {}),
+                        "nasdaq": data_cache.get('nasdaq', {}),
+                        "adrs": data_cache.get('adrs', {}),
+                        "adrs_snapshots": data_cache.get('adrs_snapshots', {}),
+                        "macro": data_cache.get('macro', {})
+                    }
                 }
-            }
         elif path_only == '/api/health':
             payload = {
                 "status": "ok",
@@ -891,11 +1249,29 @@ class APIHandler(BaseHTTPRequestHandler):
                 "mode": "real"
             }
         elif path_only == '/api/update':
-            fetch_market_data()
-            payload = {
-                "status": "updated",
-                "timestamp": datetime.now().isoformat()
-            }
+            # Verificar se realmente precisa atualizar
+            if is_cache_valid():
+                logger.info("📦 Cache ainda válido - retornando dados existentes")
+                payload = {
+                    "status": "cached",
+                    "timestamp": data_cache.get('timestamp', datetime.now().isoformat()),
+                    "message": "Cache ainda válido"
+                }
+            else:
+                # Forçar atualização usando método assíncrono
+                logger.info("🔄 Forçando atualização de dados")
+                start_time = time.time()
+                fetch_market_data()  # Já usa método assíncrono internamente
+                end_time = time.time()
+                duration = round((end_time - start_time) * 1000)
+                
+                payload = {
+                    "status": "updated",
+                    "timestamp": data_cache.get('timestamp', datetime.now().isoformat()),
+                    "duration_ms": duration,
+                    "message": f"Dados atualizados em {duration}ms"
+                }
+                logger.info(f"⚡ Atualização concluída em {duration}ms")
         elif path_only == '/api/vix':
             payload = data_cache.get('vix', {})
         elif path_only == '/api/gold':
@@ -954,7 +1330,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_response(status_code)
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Cache-Control, Pragma')
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.end_headers()
 
@@ -970,7 +1346,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Cache-Control, Pragma')
         self.end_headers()
 
 def run_server():
@@ -994,11 +1370,11 @@ def run_server():
     logger.info("  GET /api/quote?ticker=XYZ - Detalhe (At Close, After Hours e série)")
     logger.info("")
     logger.info("💡 Para atualizar dados: http://localhost:5000/api/update")
-    logger.info("⏰ Atualizações automáticas a cada 5 minutos")
+    logger.info("⏰ Atualizações automáticas a cada 3 minutos")
     
-    # Configurar agendamento automático
-    schedule.every(5).minutes.do(fetch_market_data)
-    logger.info("⏰ Agendamento automático configurado: a cada 5 minutos")
+    # Configurar agendamento automático otimizado
+    schedule.every(3).minutes.do(fetch_market_data)  # Reduzido para 3 minutos
+    logger.info("⏰ Agendamento automático configurado: a cada 3 minutos")
     
     # Iniciar atualização automática em thread separada
     def run_scheduler():
