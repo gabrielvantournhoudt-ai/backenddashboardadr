@@ -436,6 +436,285 @@ def process_adr_data(meta, after_hours_price, post_change_pct, post_time, regula
             }
         }
 
+def detect_vix_peaks_and_troughs(timestamps, closes):
+    """Detecta topos e fundos no VIX para análise mais detalhada"""
+    if not timestamps or not closes or len(closes) < 10:
+        return {'peaks': [], 'troughs': [], 'analysis': 'Dados insuficientes'}
+    
+    # Filtrar dados válidos
+    valid_data = [(ts, close) for ts, close in zip(timestamps, closes) if ts and close is not None]
+    if len(valid_data) < 10:
+        return {'peaks': [], 'troughs': [], 'analysis': 'Dados insuficientes'}
+    
+    prices = [close for _, close in valid_data]
+    times = [ts for ts, _ in valid_data]
+    
+    # Detectar topos e fundos usando algoritmo simples
+    peaks = []
+    troughs = []
+    
+    # Janela de análise (mínimo 3 pontos para cada lado)
+    window = min(3, len(prices) // 4)
+    
+    for i in range(window, len(prices) - window):
+        current_price = prices[i]
+        
+        # Verificar se é um pico (máximo local)
+        is_peak = True
+        for j in range(i - window, i + window + 1):
+            if j != i and j >= 0 and j < len(prices) and prices[j] >= current_price:
+                is_peak = False
+                break
+        
+        if is_peak:
+            peaks.append({
+                'time': times[i],
+                'price': current_price,
+                'index': i
+            })
+        
+        # Verificar se é um vale (mínimo local)
+        is_trough = True
+        for j in range(i - window, i + window + 1):
+            if j != i and j >= 0 and j < len(prices) and prices[j] <= current_price:
+                is_trough = False
+                break
+        
+        if is_trough:
+            troughs.append({
+                'time': times[i],
+                'price': current_price,
+                'index': i
+            })
+    
+    # Análise dos padrões
+    analysis = "Análise de topos e fundos: "
+    
+    if len(peaks) > 0 and len(troughs) > 0:
+        latest_peak = max(peaks, key=lambda x: x['index'])
+        latest_trough = max(troughs, key=lambda x: x['index'])
+        
+        if latest_peak['index'] > latest_trough['index']:
+            analysis += f"Último movimento: TOPO em {latest_peak['price']:.2f}"
+        else:
+            analysis += f"Último movimento: FUNDO em {latest_trough['price']:.2f}"
+    elif len(peaks) > 0:
+        latest_peak = max(peaks, key=lambda x: x['index'])
+        analysis += f"Último movimento: TOPO em {latest_peak['price']:.2f}"
+    elif len(troughs) > 0:
+        latest_trough = max(troughs, key=lambda x: x['index'])
+        analysis += f"Último movimento: FUNDO em {latest_trough['price']:.2f}"
+    else:
+        analysis += "Movimento lateral sem topos/fundos claros"
+    
+    return {
+        'peaks': peaks,
+        'troughs': troughs,
+        'analysis': analysis,
+        'total_points': len(valid_data)
+    }
+
+def analyze_vix_peaks_trend(timestamps, closes, current_price):
+    """Analisa tendência do VIX de forma simplificada - MANTENDO ALTA ou DIMINUINDO ALTA"""
+    if not timestamps or not closes or current_price is None:
+        logger.warning("VIX peaks: Dados básicos insuficientes")
+        return {
+            'trend_type': 'indefinida',
+            'trend_direction': 'neutra',
+            'ibov_impact': 'neutro',
+            'interpretation': 'Dados insuficientes para análise',
+            'color': 'neutral'
+        }
+    
+    # Pegar dados dos últimos 15 minutos (aproximadamente 3 pontos de 5min)
+    recent_data = []
+    max_points = min(3, len(timestamps))  # 3 pontos = 15 minutos de dados de 5min
+    
+    for i in range(max(0, len(timestamps) - max_points), len(timestamps)):
+        if i < len(timestamps) and i < len(closes):
+            ts = timestamps[i]
+            close = closes[i]
+            if ts and close is not None:
+                recent_data.append((ts, close))
+    
+    if len(recent_data) < 2:
+        return {
+            'trend_type': 'indefinida',
+            'trend_direction': 'neutra',
+            'ibov_impact': 'neutro',
+            'interpretation': 'Dados insuficientes para análise',
+            'color': 'neutral'
+        }
+    
+    # Análise simplificada baseada em variação
+    prices = [close for _, close in recent_data]
+    first_price = prices[0]
+    last_price = prices[-1]
+    
+    # Calcular variação total
+    total_change = ((last_price - first_price) / first_price) * 100 if first_price != 0 else 0
+    
+    logger.info(f"VIX peaks: {len(prices)} pontos, first={first_price}, last={last_price}, change={total_change:.2f}%")
+    
+    # Análise simplificada - apenas MANTENDO ou DIMINUINDO
+    if total_change > 0.5:  # VIX subindo
+        trend_type = 'ascendente'
+        trend_direction = 'mantendo alta'
+        ibov_impact = 'negativo'
+        color = 'red'
+        interpretation = "VIX MANTENDO ALTA, VOLATILIDADE FICANDO MAIS NEGATIVA PARA IBOV"
+        logger.info(f"VIX peaks: MANTENDO ALTA detectado (change={total_change:.2f}%)")
+    elif total_change < -0.5:  # VIX descendo
+        trend_type = 'descendente'
+        trend_direction = 'diminuindo alta'
+        ibov_impact = 'positivo'
+        color = 'green'
+        interpretation = "VIX DIMINUINDO ALTA, VOLATILIDADE FICANDO MENOS NEGATIVA PARA IBOV"
+        logger.info(f"VIX peaks: DIMINUINDO ALTA detectado (change={total_change:.2f}%)")
+    else:  # Movimento lateral
+        trend_type = 'lateral'
+        trend_direction = 'lateral'
+        ibov_impact = 'neutro'
+        color = 'neutral'
+        interpretation = "VIX LATERAL - VOLATILIDADE NEUTRA"
+        logger.info(f"VIX peaks: Movimento lateral (change={total_change:.2f}%)")
+    
+    # Adicionar intensidade baseada na variação
+    if abs(total_change) > 5:
+        intensity = "FORTE"
+    elif abs(total_change) > 2:
+        intensity = "MODERADA"
+    else:
+        intensity = "LEVE"
+    
+    logger.info(f"VIX peaks: Resultado final - {trend_type}, {interpretation}")
+    
+    return {
+        'trend_type': trend_type,
+        'trend_direction': trend_direction,
+        'ibov_impact': ibov_impact,
+        'interpretation': f"Tendência: {interpretation}",
+        'color': color,
+        'intensity': intensity,
+        'total_change': round(total_change, 2)
+    }
+
+def analyze_vix_15min_trend(timestamps, closes, current_price):
+    """Analisa a tendência do VIX nos últimos 15 minutos para interpretação mais acertiva"""
+    if not timestamps or not closes or current_price is None:
+        logger.warning("VIX 15min: Dados básicos insuficientes")
+        return {
+            'trend_15min': 'indefinida',
+            'trend_strength': 'neutra',
+            'volatility_direction': 'neutra',
+            'interpretation': 'Dados insuficientes para análise'
+        }
+    
+    # Filtrar dados dos últimos 15 minutos usando uma abordagem mais robusta
+    # Pegar os últimos pontos disponíveis (últimos 15 minutos de dados)
+    recent_data = []
+    
+    # Se temos dados suficientes, pegar os últimos pontos (aproximadamente 15 minutos)
+    # Como o intervalo é de 15 minutos, pegamos os últimos 1-2 pontos para análise
+    max_points = min(4, len(timestamps))  # Máximo 4 pontos (1 hora de dados)
+    
+    logger.info(f"VIX 15min: Analisando {len(timestamps)} timestamps, {len(closes)} closes, max_points={max_points}")
+    
+    for i in range(max(0, len(timestamps) - max_points), len(timestamps)):
+        if i < len(timestamps) and i < len(closes):
+            ts = timestamps[i]
+            close = closes[i]
+            if ts and close is not None:
+                recent_data.append((ts, close))
+    
+    logger.info(f"VIX 15min: {len(recent_data)} pontos recentes encontrados")
+    
+    if len(recent_data) < 2:
+        logger.warning(f"VIX 15min: Apenas {len(recent_data)} pontos recentes, insuficiente para análise")
+        return {
+            'trend_15min': 'indefinida',
+            'trend_strength': 'neutra', 
+            'volatility_direction': 'neutra',
+            'interpretation': 'Dados insuficientes para análise de 15min'
+        }
+    
+    # Calcular tendência dos últimos 15 minutos
+    first_price = recent_data[0][1]
+    last_price = recent_data[-1][1]
+    price_change_15min = ((last_price - first_price) / first_price) * 100 if first_price != 0 else 0
+    
+    logger.info(f"VIX 15min: first_price={first_price}, last_price={last_price}, change={price_change_15min:.2f}%")
+    
+    # Calcular volatilidade (desvio padrão dos últimos pontos)
+    prices = [close for _, close in recent_data]
+    if len(prices) > 1:
+        mean_price = sum(prices) / len(prices)
+        variance = sum((p - mean_price) ** 2 for p in prices) / len(prices)
+        volatility = (variance ** 0.5) / mean_price * 100 if mean_price != 0 else 0
+    else:
+        volatility = 0
+    
+    # Determinar direção da tendência
+    if price_change_15min > 2:
+        trend_15min = 'alta'
+        trend_strength = 'forte' if price_change_15min > 5 else 'moderada'
+    elif price_change_15min < -2:
+        trend_15min = 'baixa'
+        trend_strength = 'forte' if price_change_15min < -5 else 'moderada'
+    else:
+        trend_15min = 'lateral'
+        trend_strength = 'neutra'
+    
+    # Determinar direção da volatilidade
+    if volatility > 3:
+        volatility_direction = 'alta'
+    elif volatility < 1:
+        volatility_direction = 'baixa'
+    else:
+        volatility_direction = 'moderada'
+    
+    # Análise da tendência anterior (comparar com dados mais antigos)
+    previous_trend = 'indefinida'
+    if len(timestamps) >= 8:  # Se temos pelo menos 2 horas de dados
+        # Pegar dados de 30-60 minutos atrás para comparar
+        mid_point = len(timestamps) // 2
+        if mid_point < len(timestamps) and mid_point < len(closes):
+            old_first_price = closes[mid_point] if closes[mid_point] is not None else None
+            if old_first_price and first_price:
+                old_change = ((first_price - old_first_price) / old_first_price) * 100
+                if old_change > 2:
+                    previous_trend = 'alta'
+                elif old_change < -2:
+                    previous_trend = 'baixa'
+                else:
+                    previous_trend = 'lateral'
+    
+    # Criar interpretação mais acertiva baseada na tendência anterior
+    if trend_15min == 'alta' and previous_trend == 'alta':
+        interpretation = f"VIX MANTENDO ALTA - VOLATILIDADE FICANDO MAIS NEGATIVA PARA IBOV"
+    elif trend_15min == 'baixa' and previous_trend == 'alta':
+        interpretation = f"VIX REDUZINDO ALTA - VOLATILIDADE FICANDO MENOS NEGATIVA PARA IBOV"
+    elif trend_15min == 'baixa' and previous_trend == 'baixa':
+        interpretation = f"VIX MANTENDO QUEDA - VOLATILIDADE FICANDO MAIS POSITIVA PARA IBOV"
+    elif trend_15min == 'alta' and previous_trend == 'baixa':
+        interpretation = f"VIX REVERTENDO QUEDA - VOLATILIDADE FICANDO MAIS NEGATIVA PARA IBOV"
+    elif trend_15min == 'alta':
+        interpretation = f"VIX EM ALTA - PRESSÃO NEGATIVA PARA MERCADO BRASILEIRO"
+    elif trend_15min == 'baixa':
+        interpretation = f"VIX EM QUEDA - ALÍVIO PARA MERCADO BRASILEIRO"
+    else:
+        interpretation = f"VIX LATERAL - VOLATILIDADE {volatility_direction.upper()}"
+    
+    return {
+        'trend_15min': trend_15min,
+        'trend_strength': trend_strength,
+        'volatility_direction': volatility_direction,
+        'previous_trend': previous_trend,
+        'price_change_15min': round(price_change_15min, 2),
+        'volatility_15min': round(volatility, 2),
+        'interpretation': interpretation
+    }
+
 def process_regular_data(meta, timestamps, closes, ticker):
     """Processa dados regulares (não-ADRs) com lógica completa para VIX"""
     current_price = meta.get('regularMarketPrice')
@@ -449,7 +728,28 @@ def process_regular_data(meta, timestamps, closes, ticker):
     if current_price not in (None, 0) and previous_close not in (None, 0):
         variation = ((current_price - previous_close) / previous_close) * 100
 
-    series_ts, series_closes = trim_series_last_hours(timestamps, closes)
+    # Para VIX, usar período de 1 dia (início do pregão 5h BR) em vez de 36 horas
+    is_vix = ticker == TICKERS['vix']
+    if is_vix:
+        # Calcular início do pregão brasileiro (5h BR = 8h UTC)
+        now_utc = datetime.now(timezone.utc)
+        today_5h_br = now_utc.replace(hour=8, minute=0, second=0, microsecond=0)  # 5h BR = 8h UTC
+        if now_utc.hour < 8:  # Se ainda não são 5h BR, usar o dia anterior
+            today_5h_br = today_5h_br.replace(day=today_5h_br.day - 1)
+        
+        # Filtrar dados a partir do início do pregão
+        pregão_start_ts = int(today_5h_br.timestamp())
+        filtered_ts = []
+        filtered_closes = []
+        
+        for ts, close in zip(timestamps, closes):
+            if ts and close is not None and ts >= pregão_start_ts:
+                filtered_ts.append(ts)
+                filtered_closes.append(close)
+        
+        series_ts, series_closes = filtered_ts, filtered_closes
+    else:
+        series_ts, series_closes = trim_series_last_hours(timestamps, closes)
 
     # Lógica para calcular open_price, open_time e open_change_percent (necessário para VIX)
     open_price = None
@@ -601,7 +901,16 @@ def process_regular_data(meta, timestamps, closes, ticker):
         except Exception:
             close_change_pct = None
 
-    return {
+    # Análise específica para VIX - tendência dos últimos 15 minutos e topos/fundos
+    vix_15min_analysis = None
+    vix_peaks_analysis = None
+    vix_peaks_trend_analysis = None
+    if is_vix:
+        vix_15min_analysis = analyze_vix_15min_trend(series_ts, series_closes, current_price)
+        vix_peaks_analysis = detect_vix_peaks_and_troughs(series_ts, series_closes)
+        vix_peaks_trend_analysis = analyze_vix_peaks_trend(series_ts, series_closes, current_price)
+    
+    result = {
         'current': round(current_price, 2) if current_price is not None else None,
         'variation': round(variation, 2) if variation is not None else None,
         'timestamp': datetime.now(timezone.utc).isoformat(),
@@ -621,12 +930,26 @@ def process_regular_data(meta, timestamps, closes, ticker):
         'open_change_percent': round(open_change_pct, 2) if open_change_pct is not None else None,
         'at_close_display_time': display_close_br_iso
     }
-    return None
+    
+    # Adicionar análises para VIX
+    if is_vix and vix_15min_analysis:
+        result['vix_15min_analysis'] = vix_15min_analysis
+    if is_vix and vix_peaks_analysis:
+        result['vix_peaks_analysis'] = vix_peaks_analysis
+    if is_vix and vix_peaks_trend_analysis:
+        result['vix_peaks_trend_analysis'] = vix_peaks_trend_analysis
+    
+    return result
 
 async def fetch_yahoo_data_async(session, ticker, is_adr=False):
     """Versão assíncrona para buscar dados do Yahoo Finance"""
     try:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=2d&interval=15m&includePrePost=true"
+        # Para VIX, usar intervalo de 5 minutos para melhor análise de topos e fundos
+        if ticker == TICKERS['vix']:
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=1d&interval=5m&includePrePost=true"
+        else:
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=2d&interval=15m&includePrePost=true"
+        
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
@@ -648,8 +971,12 @@ async def fetch_yahoo_data_async(session, ticker, is_adr=False):
 def fetch_yahoo_data(ticker, is_adr=False):
     """Busca dados reais do Yahoo Finance - After Market para ADRs"""
     try:
-        # Usamos o endpoint de chart pois contém campos de post-market e regular
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=2d&interval=15m&includePrePost=true"
+        # Para VIX, usar intervalo de 5 minutos para melhor análise de topos e fundos
+        if ticker == TICKERS['vix']:
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=1d&interval=5m&includePrePost=true"
+        else:
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=2d&interval=15m&includePrePost=true"
+        
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
