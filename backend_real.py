@@ -57,6 +57,10 @@ QUOTE_CACHE = {}
 QUOTE_TTL = 300  # 5 minutos - aumentado para reduzir chamadas
 MARKET_CACHE_TTL = 120  # 2 minutos para dados de mercado
 
+# Cache para consultas Supabase (evitar consultas repetidas)
+SUPABASE_QUERY_CACHE = {}
+SUPABASE_CACHE_TTL = 300  # 5 minutos
+
 SUPABASE_CLIENT: Optional[Client] = None
 
 
@@ -236,6 +240,16 @@ def store_snapshot_locally(ticker: str, snapshot_type: str, snapshot: Dict[str, 
 
 
 def get_snapshot_history_from_supabase(ticker: str, snapshot_type: str, limit: int = 50):
+    # Verificar cache primeiro
+    cache_key = f"{ticker}_{snapshot_type}_{limit}"
+    current_time = datetime.now(timezone.utc).timestamp()
+    
+    if cache_key in SUPABASE_QUERY_CACHE:
+        cached_data, cached_time = SUPABASE_QUERY_CACHE[cache_key]
+        if current_time - cached_time < SUPABASE_CACHE_TTL:
+            logger.info(f"📦 Retornando dados do cache para {ticker}/{snapshot_type}")
+            return cached_data
+    
     client = get_supabase_client()
     
     # Tentar buscar do Supabase se disponível
@@ -269,7 +283,12 @@ def get_snapshot_history_from_supabase(ticker: str, snapshot_type: str, limit: i
                     .limit(limit) \
                     .execute()
             
-            return resp.data or []
+            data = resp.data or []
+            
+            # Armazenar no cache
+            SUPABASE_QUERY_CACHE[cache_key] = (data, current_time)
+            
+            return data
         except Exception as exc:
             logger.error(f'Erro ao consultar histórico Supabase {ticker}/{snapshot_type}: {exc}')
     
